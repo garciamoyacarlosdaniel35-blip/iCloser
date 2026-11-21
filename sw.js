@@ -1,5 +1,5 @@
 // iCloser: guarda la app en el celular para que abra rápido y sin internet
-const CACHE = 'icloser-v1';
+const CACHE = 'icloser-v2';
 const FILES = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', e => {

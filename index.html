@@ -412,26 +412,85 @@ $('#fileCam').addEventListener('change', onFile);
 $('#fileGal').addEventListener('change', onFile);
 
 // Quitar fondo con IA que corre dentro del celular (gratis, sin enviar la foto a ningún servidor)
-let bgLib = null;
+// Motor principal: modelo RMBG 1.4 de Hugging Face con Transformers.js. Respaldo: librería imgly.
+const TJS_URL = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+let rmbgPromesa = null;
+function busyMsg(t){ $('#busyText').textContent = t; }
+function cargarRMBG(){
+  if(rmbgPromesa) return rmbgPromesa;
+  rmbgPromesa = (async ()=>{
+    const T = await import(TJS_URL);
+    T.env.allowLocalModels = false;
+    const progreso = p=>{ if(p.status==='progress' && /onnx$/.test(p.file||'')) busyMsg('Descargando IA ' + Math.round(p.progress||0) + '% (solo la primera vez)'); };
+    const model = await T.AutoModel.from_pretrained('briaai/RMBG-1.4', { config:{ model_type:'custom' }, progress_callback:progreso });
+    const processor = await T.AutoProcessor.from_pretrained('briaai/RMBG-1.4', { config:{
+      do_normalize:true, do_pad:false, do_rescale:true, do_resize:true,
+      image_mean:[0.5,0.5,0.5], feature_extractor_type:'ImageFeatureExtractor',
+      image_std:[1,1,1], resample:2, rescale_factor:0.00392156862745098,
+      size:{ width:1024, height:1024 } } });
+    return {T, model, processor};
+  })();
+  rmbgPromesa.catch(()=>{ rmbgPromesa = null; });
+  return rmbgPromesa;
+}
+async function quitarConRMBG(dataUrl){
+  const {T, model, processor} = await cargarRMBG();
+  busyMsg('Quitando el fondo…');
+  const image = await T.RawImage.fromURL(dataUrl);
+  const { pixel_values } = await processor(image);
+  const { output } = await model({ input: pixel_values });
+  const mask = await T.RawImage.fromTensor(output[0].mul(255).to('uint8')).resize(image.width, image.height);
+  const c = document.createElement('canvas'); c.width = image.width; c.height = image.height;
+  const ctx = c.getContext('2d'); ctx.drawImage(image.toCanvas(), 0, 0);
+  const px = ctx.getImageData(0, 0, c.width, c.height);
+  for(let i=0; i<mask.data.length; i++) px.data[4*i+3] = mask.data[i];
+  ctx.putImageData(px, 0, 0);
+  return recortar(c);
+}
+async function quitarConImgly(dataUrl){
+  const lib = await import('https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.4.5/+esm');
+  const blob = await lib.removeBackground(dataUrl, {output:{format:'image/png'}});
+  const im = await new Promise((ok,no)=>{ const i=new Image(); i.onload=()=>ok(i); i.onerror=no; i.src=URL.createObjectURL(blob); });
+  const c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+  c.getContext('2d').drawImage(im, 0, 0);
+  return recortar(c);
+}
+// Recorta los bordes transparentes para que la prenda llene su tarjeta
+function recortar(c){
+  const ctx = c.getContext('2d'); const {width:w, height:h} = c;
+  const d = ctx.getImageData(0,0,w,h).data;
+  let x0=w, y0=h, x1=-1, y1=-1;
+  for(let y=0; y<h; y++) for(let x=0; x<w; x++) if(d[(y*w+x)*4+3] > 20){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+  if(x1 < 0) throw new Error('La IA no encontró ninguna prenda en la foto');
+  const m = Math.round(Math.max(w,h)*0.03);
+  x0=Math.max(0,x0-m); y0=Math.max(0,y0-m); x1=Math.min(w-1,x1+m); y1=Math.min(h-1,y1+m);
+  const o = document.createElement('canvas'); o.width = x1-x0+1; o.height = y1-y0+1;
+  o.getContext('2d').drawImage(c, x0, y0, o.width, o.height, 0, 0, o.width, o.height);
+  return o.toDataURL('image/webp', 0.88);
+}
+
 $('#btnBg').addEventListener('click', async ()=>{
   if(!nueva.original) return;
   if(nueva.img !== nueva.original){ // deshacer
     nueva.img = nueva.original; $('#addImg').src = nueva.img; $('#btnBg').textContent='✨ Quitar fondo'; return;
   }
   $('#addBusy').classList.add('on'); $('#btnBg').disabled = true;
-  $('#busyText').textContent = bgLib ? 'Quitando el fondo…' : 'Preparando la IA (solo la primera vez)…';
-  try{
-    if(!bgLib) bgLib = await import('https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.4.5/+esm');
-    $('#busyText').textContent = 'Quitando el fondo…';
-    const blob = await bgLib.removeBackground(nueva.original, {output:{format:'image/webp', quality:0.85}});
-    nueva.img = await blobToDataURL(blob);
-    $('#addImg').src = nueva.img; $('#btnBg').textContent = '↩️ Restaurar fondo original';
-  }catch(err){
-    console.error(err);
-    toast('No se pudo quitar el fondo. Revisa tu conexión e inténtalo de nuevo.');
-  }finally{
-    $('#addBusy').classList.remove('on'); $('#btnBg').disabled = false;
+  busyMsg('Preparando la IA…');
+  $('#bgNote').textContent = 'La primera vez descarga el modelo de IA (unos 45 MB). Después funciona más rápido y sin costo.';
+  let resultado = null, errores = [];
+  try{ resultado = await quitarConRMBG(nueva.original); }
+  catch(e){ console.error(e); errores.push('Motor 1: ' + (e && e.message || e)); }
+  if(!resultado){
+    try{ busyMsg('Probando otro método…'); resultado = await quitarConImgly(nueva.original); }
+    catch(e){ console.error(e); errores.push('Motor 2: ' + (e && e.message || e)); }
   }
+  if(resultado){
+    nueva.img = resultado; $('#addImg').src = nueva.img; $('#btnBg').textContent = '↩️ Restaurar fondo original';
+  }else{
+    toast('No se pudo quitar el fondo. Puedes guardar la prenda así.');
+    $('#bgNote').innerHTML = '<b>Detalle para Claude:</b> ' + esc(errores.join(' | ')).slice(0,400);
+  }
+  $('#addBusy').classList.remove('on'); $('#btnBg').disabled = false;
 });
 
 $('#btnSave').addEventListener('click', async ()=>{
